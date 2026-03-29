@@ -121,9 +121,13 @@ def search_hotels(session):
 def check_availability(hotels):
     """
     Check which hotels have rooms available for ALL nights July 1-5.
-    Returns a list of dicts with available hotel/room info.
+
+    Real availability = available - wlAvailable (waitlist count).
+    When available == wlAvailable, the night is waitlist-only, not truly bookable.
+    A room is only "fully available" if every night has real availability > 0.
     """
-    available = []
+    fully_available = []
+    partially_available = []
 
     for hotel in hotels:
         hotel_name = hotel["name"]
@@ -136,27 +140,47 @@ def check_availability(hotels):
             if not inventory:
                 continue
 
-            # A room is fully available if every night has available > 0
-            all_available = all(night.get("available", 0) > 0 for night in inventory)
-
-            if all_available:
-                rates = [night["rate"] for night in inventory if night.get("rate", 0) > 0]
-                avg_rate = sum(rates) / len(rates) if rates else 0
-                available.append({
-                    "hotel": hotel_name,
-                    "room": room_name,
-                    "avg_rate": avg_rate,
-                    "nights": [
-                        {
-                            "date": f"{inv['date'][0]}-{inv['date'][1]:02d}-{inv['date'][2]:02d}",
-                            "rate": inv["rate"],
-                            "available": inv["available"],
-                        }
-                        for inv in inventory
-                    ],
+            nights_info = []
+            for inv in inventory:
+                real = inv.get("available", 0) - inv.get("wlAvailable", 0)
+                wl = inv.get("wlAvailable", 0)
+                if real > 0:
+                    status = "AVAILABLE"
+                elif wl > 0:
+                    status = "WAITLIST"
+                else:
+                    status = "SOLD OUT"
+                nights_info.append({
+                    "date": f"{inv['date'][0]}-{inv['date'][1]:02d}-{inv['date'][2]:02d}",
+                    "rate": inv["rate"],
+                    "real_available": real,
+                    "waitlist": wl,
+                    "status": status,
                 })
 
-    return available
+            all_real = all(n["real_available"] > 0 for n in nights_info)
+            any_real = any(n["real_available"] > 0 for n in nights_info)
+            has_waitlist_nights = any(n["status"] == "WAITLIST" for n in nights_info)
+
+            rates = [n["rate"] for n in nights_info if n["rate"] > 0]
+            avg_rate = sum(rates) / len(rates) if rates else 0
+
+            entry = {
+                "hotel": hotel_name,
+                "room": room_name,
+                "avg_rate": avg_rate,
+                "nights": nights_info,
+                "all_nights_available": all_real,
+                "has_waitlist_nights": has_waitlist_nights,
+            }
+
+            if all_real:
+                fully_available.append(entry)
+            elif any_real and has_waitlist_nights:
+                # Some nights real, some waitlist — partially available
+                partially_available.append(entry)
+
+    return fully_available, partially_available
 
 
 def notify(message):
@@ -192,14 +216,14 @@ def main():
         try:
             session = get_session()
             hotels = search_hotels(session)
-            available = check_availability(hotels)
+            fully_available, partially_available = check_availability(hotels)
 
-            if available:
+            if fully_available:
                 print(f"\n{'!'*60}")
-                print(f"  ROOMS AVAILABLE! ({len(available)} room types)")
+                print(f"  FULLY AVAILABLE (all nights confirmed): {len(fully_available)} room(s)")
                 print(f"{'!'*60}\n")
 
-                for room in available:
+                for room in fully_available:
                     room_key = f"{room['hotel']} - {room['room']}"
                     is_new = room_key not in previously_available
                     new_tag = " ** NEW **" if is_new else ""
@@ -209,18 +233,29 @@ def main():
                     print(f"  Room:  {room['room']}")
                     print(f"  Avg Rate: ${room['avg_rate']:.2f}/night")
                     for night in room["nights"]:
-                        print(f"    {night['date']}: ${night['rate']:.2f} "
-                              f"({night['available']} avail)")
+                        print(f"    {night['date']}: ${night['rate']:.2f} [{night['status']}]")
                     print()
 
                     if is_new:
-                        notify(f"{room['hotel']} - {room['room']} "
+                        notify(f"BOOKABLE: {room['hotel']} - {room['room']} "
                                f"(${room['avg_rate']:.0f}/night)")
 
                 print(f"  Book now: {BOOKING_URL}")
                 print()
-            else:
-                print(f"[{now}] No full-stay availability found. "
+
+            if partially_available:
+                print(f"  --- Partially available (some nights waitlisted): "
+                      f"{len(partially_available)} room(s) ---\n")
+                for room in partially_available:
+                    wl_nights = [n["date"] for n in room["nights"] if n["status"] == "WAITLIST"]
+                    real_nights = [n["date"] for n in room["nights"] if n["status"] == "AVAILABLE"]
+                    print(f"  {room['hotel']} - {room['room']} (${room['avg_rate']:.0f}/night)")
+                    print(f"    Available: {', '.join(real_nights)}")
+                    print(f"    Waitlist:  {', '.join(wl_nights)}")
+                    print()
+
+            if not fully_available and not partially_available:
+                print(f"[{now}] No availability found. "
                       f"({len(hotels)} hotels checked)")
                 previously_available.clear()
 
